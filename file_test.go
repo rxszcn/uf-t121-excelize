@@ -181,6 +181,142 @@ func TestWriteTo(t *testing.T) {
 	}
 }
 
+// failingWriter is an io.Writer that always returns the configured error. It is
+// handed out only for one specific archive entry; every other entry receives a
+// normal in-memory writer.
+type failingWriter struct {
+	err error
+}
+
+func (w *failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+// recordingZipWriter wraps errZipWriter and records the order in which Create
+// is invoked, so tests can assert fail-fast behavior (no entry is created after
+// the first failing entry).
+type recordingZipWriter struct {
+	*errZipWriter
+	created []string
+}
+
+func (m *recordingZipWriter) Create(name string) (io.Writer, error) {
+	m.created = append(m.created, name)
+	return m.errZipWriter.Create(name)
+}
+
+// TestWriteToZipWriteErrorPropagation exercises the in-memory (Pkg) and
+// on-disk (tempFiles) archive entry writers with fault injection. It pins down
+// that an underlying write failure is surfaced as an explicit error instead of
+// being silently swallowed, that the error is not overwritten by later
+// successful writes, and that writing stops at the first failure.
+func TestWriteToZipWriteErrorPropagation(t *testing.T) {
+	// Entries are iterated in reverse-sorted order, so the lexicographically
+	// larger "zzz-fail" is written first and "aaa-ok" afterwards. Under the old
+	// code the successful write of "aaa-ok" reset the shared error to nil and the
+	// corrupted archive was reported as success.
+	const failEntry, okEntry = "zzz-fail", "aaa-ok"
+
+	// newFaultingZipWriter returns a ZipWriter whose writer for failEntry always
+	// fails, while every other entry is written successfully.
+	newFaultingZipWriter := func(failErr error) *recordingZipWriter {
+		return &recordingZipWriter{
+			errZipWriter: &errZipWriter{
+				createFunc: func(name string) (io.Writer, error) {
+					if name == failEntry {
+						return &failingWriter{err: failErr}, nil
+					}
+					return &bytes.Buffer{}, nil
+				},
+			},
+		}
+	}
+
+	t.Run("pkg_write_error_is_not_overwritten", func(t *testing.T) {
+		injected := errors.New("injected pkg write failure")
+		f, buf := File{Pkg: sync.Map{}}, bytes.Buffer{}
+		f.Pkg.Store(failEntry, []byte("failing entry"))
+		f.Pkg.Store(okEntry, []byte("entry written after the failure"))
+		zw := newFaultingZipWriter(injected)
+		f.SetZipWriter(func(io.Writer) ZipWriter { return zw })
+
+		_, err := f.WriteTo(&buf)
+		assert.EqualError(t, err, injected.Error())
+		// Fail-fast: the failing entry is created first and the entry that sorts
+		// after it is never created nor written.
+		assert.Equal(t, []string{failEntry}, zw.created)
+	})
+
+	t.Run("temp_file_write_error_is_not_overwritten", func(t *testing.T) {
+		injected := errors.New("injected tempfile write failure")
+		f, buf := File{tempFiles: sync.Map{}}, bytes.Buffer{}
+		for _, path := range []string{failEntry, okEntry} {
+			tmp, err := os.CreateTemp("", "excelize-fault-*")
+			require.NoError(t, err)
+			_, err = tmp.WriteString("temporary entry " + path)
+			require.NoError(t, err)
+			require.NoError(t, tmp.Close())
+			f.tempFiles.Store(path, tmp.Name())
+			t.Cleanup(func() { _ = os.Remove(tmp.Name()) })
+		}
+		zw := newFaultingZipWriter(injected)
+		f.SetZipWriter(func(io.Writer) ZipWriter { return zw })
+
+		_, err := f.WriteTo(&buf)
+		assert.EqualError(t, err, injected.Error())
+		// Fail-fast across the tempFiles loop as well.
+		assert.Equal(t, []string{failEntry}, zw.created)
+	})
+}
+
+// TestWriteToBufferSuccessArchiveIntact verifies the success-path artifact: the
+// produced bytes must form a valid ZIP archive readable by archive/zip, every
+// stored entry must round-trip byte-for-byte, and the workbook must open and be
+// readable again downstream. This guards against regressions while the error
+// propagation path was tightened.
+func TestWriteToBufferSuccessArchiveIntact(t *testing.T) {
+	f := NewFile()
+	const cellValue = "success-path-payload"
+	require.NoError(t, f.SetCellValue("Sheet1", "A1", cellValue))
+
+	buf, err := f.WriteToBuffer()
+	require.NoError(t, err)
+	require.NotNil(t, buf)
+
+	// The bytes form a valid ZIP archive and every entry round-trips exactly.
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+	for _, entry := range zr.File {
+		rc, err := entry.Open()
+		require.NoError(t, err)
+		got, err := io.ReadAll(rc)
+		require.NoError(t, err)
+		require.NoError(t, rc.Close())
+
+		want, ok := f.Pkg.Load(entry.Name)
+		require.True(t, ok, "unexpected archive entry %s", entry.Name)
+		assert.Equal(t, want.([]byte), got, "entry %s changed on the success path", entry.Name)
+	}
+	assert.Len(t, zr.File, countPkgEntries(f))
+
+	// Downstream can open the produced archive and read the cell back.
+	reopened, err := OpenReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+	got, err := reopened.GetCellValue("Sheet1", "A1")
+	require.NoError(t, err)
+	assert.Equal(t, cellValue, got)
+	require.NoError(t, reopened.Close())
+	require.NoError(t, f.Close())
+}
+
+// countPkgEntries returns the number of entries held in the in-memory package
+// map, matching what writeToZip serializes on the success path.
+func countPkgEntries(f *File) (count int) {
+	f.Pkg.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return
+}
+
 func TestClose(t *testing.T) {
 	f := NewFile()
 	f.tempFiles.Store("/d/", "/d/")
